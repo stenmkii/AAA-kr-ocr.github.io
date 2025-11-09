@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>韓国語 手書き学習</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <!-- 1. CSVパーサー (PapaParse.js) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <!-- 2. 手書き認識 (Tesseract.js) -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            max-width: 600px;
+            margin: auto;
+            padding: 20px;
+            background-color: #f4f4f9;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        /* キャンバスエリア */
+        #canvas-container {
+            position: relative;
+            width: 100%;
+            max-width: 400px;
+            margin: 10px auto;
+        }
+        #draw-canvas {
+            border: 3px solid #555;
+            background-color: #ffffff;
+            cursor: crosshair;
+            touch-action: none; /* スマホでの描画中にスクロールさせない */
+            width: 100%;
+            height: auto;
+            aspect-ratio: 2 / 1; /* 幅400, 高さ200 の比率を維持 */
+            border-radius: 8px;
+        }
+        /* 問題・ステータス表示 */
+        #question-area {
+            font-size: 2em;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 10px;
+            color: #005a9c;
+        }
+        #status, #result {
+            font-size: 1.1em;
+            min-height: 1.5em;
+            text-align: center;
+            margin-top: 10px;
+            border-radius: 4px;
+            padding: 5px;
+        }
+        #status {
+            color: #666;
+            background-color: #eee;
+        }
+        #result.correct {
+            color: #155724;
+            background-color: #d4edda;
+            font-weight: bold;
+        }
+        #result.incorrect {
+            color: #721c24;
+            background-color: #f8d7da;
+            font-weight: bold;
+        }
+        /* ボタン類 */
+        .button-container {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        button {
+            font-size: 1em;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button#clear-btn {
+            background-color: #6c757d;
+        }
+        button#clear-btn:hover {
+            background-color: #5a6268;
+        }
+        button#check-btn:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        input[type="file"] {
+            display: block;
+            margin: 20px auto;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>韓国語 手書き学習</h1>
+
+    <p>学習に使うCSVファイル (jp, kr) を選んでください:</p>
+    <input type="file" id="csv-file" accept=".csv">
+
+    <hr>
+
+    <div id="quiz-area" style="display: none;">
+        <h2>問題：</h2>
+        <div id="question-area">（ここに日本語）</div>
+
+        <p style="text-align: center;">下の枠に韓国語を書いてください：</p>
+        
+        <div id="canvas-container">
+            <!-- キャンバスの解像度(width/height)と表示サイズ(style)を分離 -->
+            <canvas id="draw-canvas"></canvas>
+        </div>
+
+        <div class="button-container">
+            <button id="check-btn">判定！</button>
+            <button id="clear-btn">クリア</button>
+            <button id="next-btn">次の問題</button>
+        </div>
+
+        <div id="status">（進捗）</div>
+        <div id="result">（ここに結果）</div>
+    </div>
+
+    <script>
+        // --- 0. 変数と要素の準備 ---
+        let wordList = [];
+        let currentQuestion = null;
+        let drawing = false;
+
+        const csvFileInput = document.getElementById('csv-file');
+        const quizArea = document.getElementById('quiz-area');
+        const questionArea = document.getElementById('question-area');
+        const canvas = document.getElementById('draw-canvas');
+        const checkBtn = document.getElementById('check-btn');
+        const clearBtn = document.getElementById('clear-btn');
+        const nextBtn = document.getElementById('next-btn');
+        const statusEl = document.getElementById('status');
+        const resultEl = document.getElementById('result');
+
+        // Canvasの解像度を固定
+        const CANVAS_WIDTH = 400;
+        const CANVAS_HEIGHT = 200;
+        canvas.width = CANVAS_WIDTH;
+        canvas.height = CANVAS_HEIGHT;
+        
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        // Tesseractのワーカーを準備
+        let worker = null;
+        
+        async function initializeWorker() {
+            statusEl.textContent = 'AIモデルを読み込み中 (初回のみ時間がかかります)...';
+            checkBtn.disabled = true; // 判定ボタンを無効化
+            
+            try {
+                worker = await Tesseract.createWorker('kor', undefined, {
+                    logger: m => {
+                        if (m.status === 'recognizing text') {
+                            statusEl.textContent = `認識中... (${Math.round(m.progress * 100)}%)`;
+                        } else if (m.status.startsWith('loading')) {
+                            statusEl.textContent = 'AIモデルを読み込み中...';
+                        } else {
+                            statusEl.textContent = m.status;
+                        }
+                    }
+                });
+                statusEl.textContent = 'AIモデル準備完了';
+                checkBtn.disabled = false; // 判定ボタンを有効化
+            } catch (err) {
+                statusEl.textContent = 'AIモデルの読み込みに失敗しました。';
+                console.error(err);
+            }
+        }
+        initializeWorker();
+
+
+        // --- 1. CSV読み込み ---
+        csvFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            Papa.parse(file, {
+                header: true,
+                skipEmptyLines: true,
+                encoding: "UTF-8", // 文字化け対策
+                complete: (results) => {
+                    wordList = results.data.filter(d => d.jp && d.kr); // jpとkrが空でない行のみ
+                    if (wordList.length > 0) {
+                        quizArea.style.display = 'block';
+                        loadNextQuestion();
+                    } else {
+                        alert('CSVファイルが空か、形式が正しくありません (jp, kr ヘッダーが必要です)');
+                    }
+                }
+            });
+        });
+
+        // --- 2. クイズロジック ---
+        function loadNextQuestion() {
+            if (wordList.length === 0) {
+                questionArea.textContent = '問題がありません';
+                return;
+            }
+            // ランダムに問題を選択
+            const randomIndex = Math.floor(Math.random() * wordList.length);
+            currentQuestion = wordList[randomIndex];
+            
+            questionArea.textContent = currentQuestion.jp;
+            clearCanvas();
+            resultEl.textContent = '';
+            resultEl.className = '';
+            statusEl.textContent = 'AIモデル準備完了'; // ステータスをリセット
+        }
+
+        // --- 3. Canvas描画ロジック ---
+        
+        // Canvasの表示サイズに対する実際の位置を計算
+        function getPosition(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+
+            // タッチイベントまたはマウスイベントに対応
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            
+            return {
+                x: (clientX - rect.left) * scaleX,
+                y: (clientY - rect.top) * scaleY
+            };
+        }
+
+        function startDrawing(e) {
+            e.preventDefault(); // ページスクロールを防ぐ
+            drawing = true;
+            const pos = getPosition(e);
+            ctx.beginPath();
+            ctx.moveTo(pos.x, pos.y);
+        }
+
+        function draw(e) {
+            e.preventDefault();
+            if (!drawing) return;
+            const pos = getPosition(e);
+            ctx.lineTo(pos.x, pos.y);
+            ctx.stroke();
+        }
+
+        function stopDrawing(e) {
+            e.preventDefault();
+            drawing = false;
+        }
+
+        function clearCanvas() {
+            // 白い背景で塗りつぶす (Tesseractは黒文字/白背景を好む)
+            ctx.fillStyle = 'white';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // 描画設定
+            ctx.strokeStyle = 'black'; // 線の色
+            ctx.lineWidth = 8;       // 線の太さ (少し太め)
+            ctx.lineCap = 'round';     // 線の端を丸く
+            ctx.lineJoin = 'round';    // 線の接合部を丸く
+        }
+        
+        clearCanvas(); // 初期化
+
+        // PCマウスイベント
+        canvas.addEventListener('mousedown', startDrawing);
+        canvas.addEventListener('mousemove', draw);
+        canvas.addEventListener('mouseup', stopDrawing);
+        canvas.addEventListener('mouseout', stopDrawing);
+        
+        // スマホタッチイベント
+        canvas.addEventListener('touchstart', startDrawing);
+        canvas.addEventListener('touchmove', draw);
+        canvas.addEventListener('touchend', stopDrawing);
+
+        // ボタンのイベントリスナー
+        clearBtn.addEventListener('click', clearCanvas);
+        nextBtn.addEventListener('click', loadNextQuestion);
+
+
+        // --- 4. 手書き認識と判定 ---
+        checkBtn.addEventListener('click', async () => {
+            if (!currentQuestion || !worker || checkBtn.disabled) return;
+
+            checkBtn.disabled = true; // 認識中はボタンを無効化
+            resultEl.textContent = '...';
+            statusEl.textContent = '画像認識の準備中...';
+
+            try {
+                // Tesseract.jsで認識実行
+                const { data: { text } } = await worker.recognize(canvas);
+                
+                statusEl.textContent = '認識完了';
+                
+                // 認識結果と正解から空白を除去して比較
+                const recognizedText = text.replace(/\s/g, ''); 
+                const correctAnswer = currentQuestion.kr.replace(/\s/g, '');
+
+                console.log(`認識結果: "${recognizedText}", 正解: "${correctAnswer}"`);
+
+                if (recognizedText === correctAnswer) {
+                    resultEl.textContent = `正解！ (${recognizedText})`;
+                    resultEl.className = 'correct';
+                } else {
+                    resultEl.textContent = `不正解... (あなたの回答: ${recognizedText} / 正解: ${correctAnswer})`;
+                    resultEl.className = 'incorrect';
+                }
+            } catch (err) {
+                console.error(err);
+                statusEl.textContent = '認識中にエラーが発生しました。';
+            } finally {
+                checkBtn.disabled = false; // 認識完了後、ボタンを再度有効化
+            }
+        });
+
+    </script>
+</body>
+</html>
